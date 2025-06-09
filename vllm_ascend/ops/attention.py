@@ -155,7 +155,7 @@ def vanilla_chunked_prefill_mla(
     assert query_lens.size(0) == batch_size
     num_heads = query.size(1)
     block_size = kv_cache.size(1)
-    latent_kv_dim = kv_cache.size(3) - rope_dim
+    latent_kv_dim = kv_cache.size(-1) - rope_dim
     max_num_blocks_per_seq = block_tables.size(1)
     batch_size = query_lens.size(0)
     kv_cache = kv_cache.squeeze()
