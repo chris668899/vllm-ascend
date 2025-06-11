@@ -212,7 +212,7 @@ async def handle_completions(request: Request):
 
         # Send request to prefill service
         response = await send_request_to_service(prefill_client_info,
-                                                 "http://xx.xx.xx.xx:8100/v1/completions", req_data,
+                                                 "/completions", req_data,
                                                  request_id)
 
         # Extract the needed fields
@@ -231,7 +231,7 @@ async def handle_completions(request: Request):
         # Stream response from decode service
         async def generate_stream():
             async for chunk in stream_service_response(decode_client_info,
-                                                       "http://xx.xx.xx.xx:8200/v1/completions",
+                                                       "/completions",
                                                        req_data,
                                                        request_id=request_id):
                 yield chunk
@@ -266,5 +266,5 @@ if __name__ == '__main__':
     print("global_args", global_args)
 
     import uvicorn
-    uvicorn.run(app, host="xx.xx.xx.xx", port=8000)
+    uvicorn.run(app, host=global_args.host, port=global_args.port)
 
