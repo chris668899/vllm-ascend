@@ -22,6 +22,7 @@ import os
 import time
 import weakref
 import copy
+import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -56,11 +57,13 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
 from vllm.v1.spec_decode.utils import is_spec_decode_supported
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
+from vllm_ascend.attention.mla_v1 import CommonAttentionMetadata
 from vllm_ascend.attention.attention import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.platform import NPUPlatform
@@ -225,6 +228,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 vocab_size=self.model_config.get_vocab_size(),
             )
 
+        self.query_start_loc = torch.zeros(self.max_num_reqs + 1,
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.seq_lens = torch.zeros(self.max_num_reqs,
+                                    dtype=torch.int32,
+                                    device=self.device)
+        
         self.input_ids = torch.zeros(self.max_num_tokens,
                                      dtype=torch.int32,
                                      device=self.device)
@@ -607,18 +617,37 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         extra_builder_kwargs = {}
 
+        self.seq_lens[num_reqs:].fill_(0)
+        self.query_start_loc[num_reqs + 1:].fill_(-1)
+
+        query_start_loc = self.query_start_loc[:num_reqs + 1]
+        seq_lens = self.seq_lens[:num_reqs]
+
         # Add graph_pad_size here
         if self.enable_torchair_graph_mode:
             graph_pad_size = self.scheduler_config.max_num_seqs - len(seq_lens)
             extra_builder_kwargs['graph_pad_size'] = graph_pad_size
+        
+        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc, seq_lens=seq_lens)
 
-        attn_metadata = self.attn_metadata_builder.build(  # type: ignore
-            num_reqs=num_reqs,
-            num_actual_tokens=total_num_scheduled_tokens,
-            max_query_len=max_num_scheduled_tokens,
-            common_prefix_len=None,
-            **extra_builder_kwargs,
-        )
+        if self.vllm_config.model_config.use_mla:
+            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
+        else:
+            attn_metadata = self.attn_metadata_builder.build(  # type: ignore
+                num_reqs=num_reqs,
+                num_actual_tokens=total_num_scheduled_tokens,
+                max_query_len=max_num_scheduled_tokens,
+                common_prefix_len=None,
+                **extra_builder_kwargs,
+            )
         attn_metadata.num_input_tokens = num_input_tokens
 
         # Prepare input_ids
@@ -1267,7 +1296,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             data_ptr = tensor.data_ptr()
             aligned_addr =(data_ptr + alignment - 1) // alignment * alignment
             offset = (aligned_addr - data_ptr) // tensor.element_size()
-            return tensor[offset]
+            return tensor[int(offset):]
 
         if not (vllm_version_is("0.8.5") or vllm_version_is("0.8.5.post1")):
             self.input_batch = InputBatch(
@@ -1308,6 +1337,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         # we found there are also some exceptions during test, so we manual align those memory here, this part
                         # of code may consume 2M * 2 * elem_size memory every layer.
                         num_blocks, block_size, num_kv_heads, head_size = kv_cache_shape
+                        print("num_blocks:", num_blocks)
+                        print("block_size:", block_size)
+                        print("num_kv_heads:", num_kv_heads)
+                        print("head_size:", head_size)
                         rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
                         nope_dim = head_size - rope_dim
                         nope_allocate_shape = num_blocks * block_size * num_kv_heads * nope_dim
@@ -1316,18 +1349,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         rope_allocate_shape_alignment = rope_allocate_shape + alignment
                         nope_cache_shape = (num_blocks, block_size, num_kv_heads, nope_dim)
                         rope_cache_shape = (num_blocks, block_size, num_kv_heads, rope_dim)
-                        rope_cache = torch.zeros(nope_allocate_shape_alignment, dtype=dtype, device=self.device)
-                        nope_cache = torch.zeros(rope_allocate_shape_alignment, dtype=dtype, device=self.device)
-                        rope_cache = align_memory(nope_cache, alignment)[:nope_allocate_shape].view(nope_cache_shape)
-                        nope_cache = align_memory(rope_cache, alignment)[:rope_allocate_shape].view(rope_cache_shape)
+                        nope_cache = torch.zeros(nope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        rope_cache = torch.zeros(rope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        nope_cache = align_memory(nope_cache, alignment)[:nope_allocate_shape].view(nope_cache_shape)
+                        rope_cache = align_memory(rope_cache, alignment)[:rope_allocate_shape].view(rope_cache_shape)
+                        # rope_cache = torch.zeros(nope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        # nope_cache = torch.zeros(rope_allocate_shape_alignment, dtype=dtype, device=self.device)
+                        # rope_cache = align_memory(nope_cache, alignment)[:nope_allocate_shape].view(nope_cache_shape)
+                        # nope_cache = align_memory(rope_cache, alignment)[:rope_allocate_shape].view(rope_cache_shape)
                         kv_caches[layer_name] = (nope_cache, rope_cache)
                     else:
                         num_caches = kv_cache_shape[0]
                         kv_cache_list = []
                         for i in range(num_caches):
                             cache_shape = kv_cache_shape[1:]
-                            kv_cache_for_compute = torch.zeros(cache_shape, dtype=dtype, device=self.device)
-                            kv_cache_list.append(kv_cache_for_compute)
+                            # add align memory allocate for dense model
+                            cache_size = math.prod(cache_shape)
+                            cache_size_aligned = cache_size + alignment
+                            kv_cache = torch.zeros(cache_size_aligned, dtype=dtype, device=self.device)
+                            kv_cache = align_memory(kv_cache, alignment)[:cache_size].view(cache_shape)
+                            kv_cache_list.append(kv_cache)
                         kv_caches[layer_name] = kv_cache_list
                         # torch_npu.npu_format_cast(kv_caches[layer_name], 2)
                 else:
