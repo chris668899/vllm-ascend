@@ -349,7 +349,7 @@ class MooncakeConnectorWorker:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_group = get_tp_group()
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
-        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.dp_size = vllm_config.parallel_config.data_parallel_size_local
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_local_ip_by_remote()
         self.max_device_id = self.tp_size * self.dp_size
@@ -364,18 +364,24 @@ class MooncakeConnectorWorker:
 
         # get tp device id
         # self.device_id = (self.dp_rank * self.tp_size + self.tp_rank)
-        device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "-1")
+        # note: https://github.com/vllm-project/vllm-ascend/pull/940 introducing some changes
+        device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", None)
+        
         logger.info(f"os getenv ASCEND_RT_VISIBLE_DEVICES: {device_ids}")
-        device_ids = device_ids.split(',')
+        #device_ids = device_ids.split(',')
+        if device_ids is None:
+            device_ids = list(range(self.dp_rank * self.tp_size, (self.dp_rank+1) * self.tp_size))
+        else:
+            device_ids = list(map(int, device_ids.split(',')))
         assert len(device_ids) > self.tp_rank
         self.device_id = device_ids[self.tp_rank]
         logger.info(f"dp_rank {self.dp_rank} "
-                    f"tp_rank {self.tp_rank} device_ids {self.device_id}")
+                    f"tp_rank {self.tp_rank} device_id {self.device_id}")
 
         self.ib_device = None
         self._initialize(
             hostname=self.side_channel_host+':' +
-                     str(self.side_channel_port + self.tp_rank + self.max_device_id)+':'+'npu_'+self.device_id,
+                     str(self.side_channel_port + self.tp_rank + self.max_device_id)+':'+'npu_'+ str(self.device_id),
             device_name=self.ib_device,
         )
 
@@ -499,7 +505,7 @@ class MooncakeConnectorWorker:
                 else:
                     logger.error(
                         "Connection listener got unexpected message %s", msg)
-                ready_event.set()
+                # ready_event.set()
 
     def _message_req(self, host: str, port: int, msg: tuple[bytes, str]):
         """send a normal message with a remote instance."""
@@ -508,8 +514,9 @@ class MooncakeConnectorWorker:
         # NOTE(rob): we need each rank to have a unique port. This is
         # a hack to keep us moving. We will switch when moving to etcd
         # or where we have a single ZMQ socket in the scheduler.
-        remote_handshake_port = port - self.max_device_id
-        path = make_zmq_path("tcp", host, port)  #TODO 确认remote_tp_rank传值是否有问题
+        print("self.tp_rank:", self.tp_rank)
+        print("_message_req port:", port)
+        path = make_zmq_path("tcp", host, port)
         logger.debug("Querying metadata on path: %s", path)
         with zmq_ctx(zmq.REQ, path) as sock:
             # Send msg to remote. It will recv a msg in shakehand case and other would not
@@ -645,7 +652,7 @@ class MooncakeConnectorWorker:
         if self.tp_rank == 0:
             # Keep track of how many other ranks have finished.
             other_ranks_finished_ids: list[str] = []
-            for i in range(1, self.tp_rank):
+            for i in range(1, self.tp_size):
                 other_ranks_finished_ids.extend(
                     self.tp_group.recv_object(src=i))
             for req_id in other_ranks_finished_ids:
@@ -657,15 +664,14 @@ class MooncakeConnectorWorker:
             # Return ids that finished on all ranks to the scheduler.
             all_done_recving: set[str] = set()
             for req_id in list(self._done_recving_count.keys()):
-                if self._done_recving_count[req_id] == self.tp_rank:
+                if self._done_recving_count[req_id] == self.tp_size:
                     del self._done_recving_count[req_id]
                     all_done_recving.add(req_id)
 
             all_done_sending: set[str] = set()
             for req_id in list(self._done_sending_count.keys()):
-                if (self._done_sending_count[req_id] == self.tp_rank
-                        or self._done_sending_count[req_id]
-                        == self._decode_tp_size):
+                if (self._done_sending_count[req_id] == self.tp_size
+                        or self._done_sending_count[req_id] == self._decode_tp_size):
                     del self._done_sending_count[req_id]
                     all_done_sending.add(req_id)
 
@@ -735,12 +741,7 @@ class MooncakeConnectorWorker:
         # just notify P worker that we have the blocks we need.
         num_local_blocks = len(local_block_ids)
         if num_local_blocks == 0:
-            # self._done_recving_count[request_id] += 1
-            # msg = (DONE_RECVING_MSG, request_id)
-            # self._message_req(remote_host, remote_port, remote_tp_rank, msg)
-            # return
             self._done_recving_count[request_id] += 1
-            remote_handshake_port = remote_port - self.max_device_id
             msg = (DONE_RECVING_MSG, request_id)
             self._message_req(remote_host, remote_handshake_port, msg)
             return
@@ -752,10 +753,6 @@ class MooncakeConnectorWorker:
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         from concurrent.futures import ThreadPoolExecutor
-        # grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
-        #     remote_block_ids, local_block_ids)
-        # success_count = 0
-        # futures = []
         grouped_remote_block_ids, grouped_local_block_ids = \
             group_concurrent_contiguous(remote_block_ids, local_block_ids)
 
@@ -787,8 +784,10 @@ class MooncakeConnectorWorker:
     def _transfer_sync(self, session_id: str, buffer: int,
                        peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
+        print("start transfer_sync_read")
         ret = self.engine.transfer_sync_read(session_id, buffer,
                                              peer_buffer_address, length)
+        print("end transfer_sync_read")
         if ret < 0:
             logger.error("Mooncake Transfer Engine Return Error.")
             raise RuntimeError("Mooncake Transfer Engine Return Error.")
