@@ -18,7 +18,7 @@
 import logging
 import os
 from typing import TYPE_CHECKING, Optional, Tuple
-
+import gc
 import torch
 import vllm.envs as envs
 from vllm.logger import logger
@@ -54,7 +54,8 @@ class NPUPlatform(Platform):
     device_type: str = "npu"
     simple_compile_backend: str = "eager"  # Disable torch.compile()
     ray_device_key: str = "NPU"
-    device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+    # device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+    device_control_env_var: str = "plcaceholder"
     dispatch_key: str = "PrivateUse1"
 
     supported_quantization: list[str] = [ASCEND_QUATIZATION_METHOD]
@@ -114,6 +115,12 @@ class NPUPlatform(Platform):
     @classmethod
     def mem_get_info(cls) -> Tuple[int, int]:
         return torch.npu.mem_get_info()
+
+    @classmethod
+    def clear_npu_memory(cls):
+        gc.collect()
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
@@ -240,6 +247,8 @@ class NPUPlatform(Platform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
                              kv_cache_dtype, block_size, use_v1, use_mla):
+        print("use_v1:", use_v1)
+        print("use_mla:", use_mla)
         if use_v1 and use_mla:
             return "vllm_ascend.attention.mla_v1.AscendMLABackend"
         if use_v1:
