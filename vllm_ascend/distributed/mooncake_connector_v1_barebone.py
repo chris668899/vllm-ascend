@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+UPDATE_ASYNC_REQ =False
 
 
 global MOONCAKE_BASE_PORT
@@ -349,10 +350,13 @@ class MooncakeConnectorWorker:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_group = get_tp_group()
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
-        self.dp_size = vllm_config.parallel_config.data_parallel_size_local
+        self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_local_ip_by_remote()
         self.max_device_id = self.tp_size * self.dp_size
+        
+        self.kv_role = vllm_config.kv_transfer_config.kv_role
+        
         # 单边port用于TE上进行数据面的传输
         # self.side_channel_port = (
         #     BASE_PORT +
@@ -410,6 +414,7 @@ class MooncakeConnectorWorker:
         # create async thread pool
         self.futures: dict[str, list[Future]] = {}
         self.req_record: dict[str, tuple[str, int]] = {}
+        self.sync_trans_req: list[str] = []
         
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
@@ -547,29 +552,37 @@ class MooncakeConnectorWorker:
 
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
-        kv_elem_size = first_kv_cache.element_size()
+        
+        # print("first_kv_cache.shape:",first_kv_cache.shape)
 
         # TODO(tms): Find a more robust way to detect and handle MLA
-        use_mla = first_kv_cache_tuple[0].size(
+        self.use_mla = first_kv_cache_tuple[0].size(
             -1) != first_kv_cache_tuple[1].size(-1)
-        if use_mla:
+        if self.use_mla:
             # MLA case.
-            self.num_blocks = first_kv_cache.shape[0]
-            block_rank = 2  # [block_size, latent_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
+            print("**************we are in mla***************")
+            self.num_blocks = first_kv_cache.shape[1]
+            block_rank = 3  # [block_size, latent_dim]
+            block_shape_norm = first_kv_cache_tuple[0].shape[-block_rank:]
+            block_shape_pe = first_kv_cache_tuple[1].shape[-block_rank:]
+            self.block_len = [first_kv_cache[0].element_size() * math.prod(block_shape_norm),
+                              first_kv_cache[1].element_size() * math.prod(block_shape_pe)] 
         else:
             # [2 (k and v), num_blocks, ...]
             self.num_blocks = first_kv_cache.shape[1]
+            kv_elem_size = first_kv_cache.element_size()
             block_rank = 3  # [block_size, kv_heads, head_dim]
             block_shape = first_kv_cache.shape[-block_rank:]
+            self.block_len = kv_elem_size * math.prod(block_shape)
 
-        # TODO(tms): self.block_len needs to be per-layer for sliding window,
-        # hybrid attn, etc
-        self.block_len = kv_elem_size * math.prod(block_shape)
 
-        logger.info("Registering KV_Caches. use_mla: %s, shape %s", use_mla,
+        logger.info("Registering KV_Caches. use_mla: %s, shape %s", self.use_mla,
                     first_kv_cache.shape)
-        logger.info("num_blocks: %s, block_shape: %s", self.num_blocks,
+        if self.use_mla:
+            logger.info("num_blocks: %s, block_shape_norm: %s, block_shape_pe: %s", self.num_blocks,
+                    block_shape_norm, block_shape_pe)
+        else:
+            logger.info("num_blocks: %s, block_shape: %s", self.num_blocks,
                     block_shape)
         logger.info("Per layer kv cache size: %s", first_kv_cache.shape)
         self.kv_caches = kv_caches
@@ -577,12 +590,21 @@ class MooncakeConnectorWorker:
         
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
-            cache_list = [cache_or_caches] if use_mla else cache_or_caches
-            for cache in cache_list:
-                base_addr = cache.data_ptr()
-                region_len = self.num_blocks * self.block_len
-                kv_caches_base_addr.append(base_addr)
-                self._register(base_addr, region_len)
+            if self.use_mla:
+                for i, cache in enumerate(cache_or_caches,0):
+                    print("cache.shape:", cache.shape)
+                    kv_elem_size = cache.element_size()
+                    base_addr = cache.data_ptr()
+                    region_len = self.num_blocks * self.block_len[i%2]
+                    kv_caches_base_addr.append(base_addr)
+                    self._register(base_addr, region_len)
+            else:
+                cache_list = [cache_or_caches] if self.use_mla else cache_or_caches
+                for cache in cache_list:
+                    base_addr = cache.data_ptr()
+                    region_len = self.num_blocks * self.block_len
+                    kv_caches_base_addr.append(base_addr)
+                    self._register(base_addr, region_len)
         self.kv_caches_base_addr[self.engine_id] = kv_caches_base_addr
         self.num_layers = len(self.kv_caches.keys())
 
@@ -602,7 +624,12 @@ class MooncakeConnectorWorker:
         ready_event.wait()
 
     def _register(self, ptr, length):
-        logger.info("*--- _register: length: %s, self.num_blocks: %s, self.block_len: %s, ptr: %x", length, self.num_blocks, self.block_len, ptr)
+        if self.use_mla:
+            logger.info("*--- _register: length: %s, self.num_blocks: %s, self.block_lens: [%s,%s], ptr: %x", 
+                        length, self.num_blocks, self.block_len[0], self.block_len[1], ptr)
+        else:
+            logger.info("*--- _register: length: %s, self.num_blocks: %s, self.block_len: %s, ptr: %x", 
+                        length, self.num_blocks, self.block_len, ptr)
         ret_value = self.engine.register_memory(ptr, length)
         if ret_value != 0:
             logger.error("Mooncake memory registration failed.")
@@ -620,27 +647,37 @@ class MooncakeConnectorWorker:
     def get_finished(self) -> tuple[set[str], set[str]]:
 
         # get the async transfer completed tasks (done recving)
-        for req in self.futures.keys():
-            success_count = 0
-            try:
-                # 获取每个任务的返回值
-                future = self.futures[req]
-                for trans_task in future:
-                    ret = trans_task.result()
-                    # 假设status为True时表示成功
-                    if ret >= 0:
-                        success_count += 1
-            except Exception as e:
-                # 处理任务中的异常情况
-                logger.error("Mooncake Transfer Engine Return Error.")
-                raise RuntimeError("Mooncake Transfer Engine Return Error.")
+        if UPDATE_ASYNC_REQ:
+            for req in self.futures.keys():
+                success_count = 0
+                try:
+                    # 获取每个任务的返回值
+                    future = self.futures[req]
+                    for trans_task in future:
+                        ret = trans_task.result()
+                        # 假设status为True时表示成功
+                        if ret >= 0:
+                            success_count += 1
+                except Exception as e:
+                    # 处理任务中的异常情况
+                    logger.error("Mooncake Transfer Engine Return Error.")
+                    raise RuntimeError("Mooncake Transfer Engine Return Error.")
 
-            if success_count == len(self.futures[req]):
+                if success_count == len(self.futures[req]):
+                    self._done_recving_count[req] += 1
+                    msg = (DONE_RECVING_MSG, req)
+                    remote_host = self.req_record[req][0]
+                    remote_handshake_port = self.req_record[req][1]
+                    self._message_req(remote_host, remote_handshake_port, msg)
+        else:
+            for req in self.sync_trans_req:
+                logger.info("******Get Finished Sync**********")
                 self._done_recving_count[req] += 1
                 msg = (DONE_RECVING_MSG, req)
                 remote_host = self.req_record[req][0]
                 remote_handshake_port = self.req_record[req][1]
                 self._message_req(remote_host, remote_handshake_port, msg)
+                self.sync_trans_req.remove(req)
 
         done_sending = set(self._done_sending_count.keys())
         done_recving = set(self._done_recving_count.keys())
@@ -665,23 +702,24 @@ class MooncakeConnectorWorker:
             all_done_recving: set[str] = set()
             for req_id in list(self._done_recving_count.keys()):
                 if self._done_recving_count[req_id] == self.tp_size:
+                # if self._done_recving_count[req_id] == self.tp_size or self._done_recving_count[req_id] == self.decode_tp_size:
                     del self._done_recving_count[req_id]
                     all_done_recving.add(req_id)
 
             all_done_sending: set[str] = set()
             for req_id in list(self._done_sending_count.keys()):
-                if (self._done_sending_count[req_id] == self.tp_size
-                        or self._done_sending_count[req_id] == self._decode_tp_size):
+                if self._done_sending_count[req_id] == self._decode_tp_size:
                     del self._done_sending_count[req_id]
                     all_done_sending.add(req_id)
-
-            return all_done_sending, all_done_recving
+            if self.kv_role =='kv_producer':
+                return all_done_sending, None
+            else:
+                return None,all_done_recving
 
         # Ranks 1 to N-1: send finished ids to Rank 0.
         else:
             finished_req_ids = list(done_recving.union(done_sending))
             self.tp_group.send_object(finished_req_ids, dst=0)
-
             # Unused as only Rank 0 results are sent to scheduler.
             return done_sending, done_recving
 
@@ -751,43 +789,68 @@ class MooncakeConnectorWorker:
         assert num_local_blocks <= num_remote_blocks
         if num_local_blocks < num_remote_blocks:
             remote_block_ids = remote_block_ids[-num_local_blocks:]
+        if UPDATE_ASYNC_REQ:
+            from concurrent.futures import ThreadPoolExecutor
+            grouped_remote_block_ids, grouped_local_block_ids = \
+                group_concurrent_contiguous(remote_block_ids, local_block_ids)
 
-        from concurrent.futures import ThreadPoolExecutor
-        grouped_remote_block_ids, grouped_local_block_ids = \
-            group_concurrent_contiguous(remote_block_ids, local_block_ids)
+            with ThreadPoolExecutor() as executor:
 
-        with ThreadPoolExecutor() as executor:
+                # mooncake_session_id = f"{remote_host}:{remote_port}"  # our orinial
+                # TODO only support kv from P to D
+                remote_transfer_port = remote_handshake_port + self._prefill_dp_size * self._prefill_tp_size
+                mooncake_session_id = f"{remote_host}:{remote_transfer_port}"
+                
 
-            # mooncake_session_id = f"{remote_host}:{remote_port}"  # our orinial
-            # TODO only support kv from P to D
+                for k ,(src_layer_base_addr, dst_layer_base_addr) in enumerate(zip(self.kv_caches_base_addr[self.engine_id],
+                                                                    self.kv_caches_base_addr[dst_engine_id])):
+                    if self.use_mla:
+                        block_len=self.block_len[k%2]
+                    else:
+                        block_len = self.block_len
+                    for i in range(len(grouped_remote_block_ids)):
+                  
+                        src = src_layer_base_addr + grouped_local_block_ids[i][0] * block_len
+                        dst = dst_layer_base_addr + grouped_remote_block_ids[i][0] * block_len
+                        length = len(grouped_local_block_ids[i]) * block_len
+ 
+                        logger.info("****--- executor.submit, mooncake_session_id: %s, src:%s, dst: %s, length:%s", mooncake_session_id, src, dst, length)
+                        future = executor.submit(
+                            self._transfer_sync, mooncake_session_id, src, dst, length)
+                        print("****--- future: %s", future)
+                        if request_id in self.futures:
+                            self.futures[request_id].append(future)
+                        else:
+                            self.futures[request_id] = [future]
+        else:
+            self.sync_trans_req.append(request_id)
+            grouped_remote_block_ids, grouped_local_block_ids = \
+                group_concurrent_contiguous(remote_block_ids, local_block_ids)
+            
             remote_transfer_port = remote_handshake_port + self._prefill_dp_size * self._prefill_tp_size
             mooncake_session_id = f"{remote_host}:{remote_transfer_port}"
             
 
-            for src_layer_base_addr, dst_layer_base_addr in zip(self.kv_caches_base_addr[self.engine_id],
-                                                                self.kv_caches_base_addr[dst_engine_id]):
+            for k ,(src_layer_base_addr, dst_layer_base_addr) in enumerate(zip(self.kv_caches_base_addr[self.engine_id],
+                                                                    self.kv_caches_base_addr[dst_engine_id])):
+                if self.use_mla:
+                    block_len=self.block_len[k%2]
+                else:
+                    block_len = self.block_len
                 for i in range(len(grouped_remote_block_ids)):
-                    src = src_layer_base_addr + \
-                        grouped_local_block_ids[i][0] * self.block_len
-                    dst = dst_layer_base_addr + \
-                        grouped_remote_block_ids[i][0] * self.block_len
-                    length = len(grouped_local_block_ids[i]) * self.block_len
-                    logger.info("****--- executor.submit, mooncake_session_id: %s, src:%s, dst: %s, length:%s", mooncake_session_id, src, dst, length)
-                    future = executor.submit(
-                        self._transfer_sync, mooncake_session_id, src, dst, length)
-                    print("****--- future: %s", future)
-                    if request_id in self.futures:
-                        self.futures[request_id].append(future)
-                    else:
-                        self.futures[request_id] = [future]
+             
+                    src = src_layer_base_addr + grouped_local_block_ids[i][0] * block_len
+                    dst = dst_layer_base_addr + grouped_remote_block_ids[i][0] * block_len
+                    length = len(grouped_local_block_ids[i]) * block_len
+                
+                    logger.info("****--- sync transfer, mooncake_session_id: %s, src:%s, dst: %s, length:%s", mooncake_session_id, src, dst, length)
+                    ret = self._transfer_sync( mooncake_session_id, src, dst, length)
 
     def _transfer_sync(self, session_id: str, buffer: int,
                        peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
-        print("start transfer_sync_read")
         ret = self.engine.transfer_sync_read(session_id, buffer,
                                              peer_buffer_address, length)
-        print("end transfer_sync_read")
         if ret < 0:
             logger.error("Mooncake Transfer Engine Return Error.")
             raise RuntimeError("Mooncake Transfer Engine Return Error.")
