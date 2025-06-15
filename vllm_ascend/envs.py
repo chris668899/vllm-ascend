@@ -76,6 +76,19 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_LLMDD_CHANNEL_PORT", 5557),
     "MOONCAKE_CONFIG_PATH":
     lambda: os.getenv("MOONCAKE_CONFIG_PATH", None),
+     # MOE_ALL2ALL_BUFFER:
+    #   0: default, normal init.
+    #   1: enable moe_all2all_buffer.
+    "MOE_ALL2ALL_BUFFER":
+    lambda: bool(int(os.getenv("MOE_ALL2ALL_BUFFER", '0'))),
+    "VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE", '0'))),
+    "USE_OPTIMIZED_MODEL":
+    lambda: bool(int(os.getenv('USE_OPTIMIZED_MODEL', '1'))),
+    "VLLM_ASCEND_ACL_OP_INIT_MODE":
+    lambda: os.getenv("VLLM_ASCEND_ACL_OP_INIT_MODE", '0'),
+    "VLLM_ASCEND_ENABLE_DBO":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),
 }
 
 # end-env-vars-definition
