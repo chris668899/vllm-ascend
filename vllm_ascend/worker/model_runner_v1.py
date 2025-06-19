@@ -1340,7 +1340,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
-        with set_forward_context(None, self.vllm_config):
+        with set_forward_context(None, self.vllm_config, num_tokens=0):
             self.maybe_setup_kv_connector(scheduler_output)
             finsihed_sending, finished_recving = (
                 self.get_finished_kv_transfer(scheduler_output))
