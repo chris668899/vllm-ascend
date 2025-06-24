@@ -28,7 +28,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, has_kv_transfer_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
@@ -253,8 +253,12 @@ class NPUWorker(WorkerBase):
         runner = self.model_runner
         num_tokens = 1
         if runner.dp_size > 1:
-            max_num_tokens, with_prefill = runner._get_forward_metadata_across_dp(
-                1, False)
+            if has_kv_transfer_group():
+                max_num_tokens = -1
+                with_prefill = self.vllm_config.kv_transfer_config.is_kv_producer
+            else:
+                max_num_tokens, with_prefill = runner._get_forward_metadata_across_dp(
+                    1, False)
         if envs_ascend.VLLM_ENABLE_MC2 or runner.torchair_graph_enabled:
             if not with_prefill:
                 num_tokens = max_num_tokens
