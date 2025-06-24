@@ -29,7 +29,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
-    get_tp_group)
+    get_tp_group, get_dp_group, get_world_group)
 from vllm.utils import logger
 from vllm.utils import make_zmq_path, make_zmq_socket, round_down, get_ip
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -350,25 +350,15 @@ class MooncakeConnectorWorker:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.tp_group = get_tp_group()
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank_local
-        self.dp_size = vllm_config.parallel_config.data_parallel_size
+        # self.dp_size = vllm_config.parallel_config.data_parallel_size
+        self.dp_size =  vllm_config.parallel_config.data_parallel_size_local # here we use dp local size
         self.kv_caches: dict[str, torch.Tensor] = {}
         self.side_channel_host = get_local_ip_by_remote()
         self.max_device_id = self.tp_size * self.dp_size
         
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         
-        # 单边port用于TE上进行数据面的传输
-        # self.side_channel_port = (
-        #     BASE_PORT +
-        #     self.dp_rank * self.tp_size + self.tp_rank + self.max_device_id)
-        self.side_channel_port = (
-                BASE_PORT +
-                vllm_config.parallel_config.data_parallel_rank_local *
-                vllm_config.parallel_config.tensor_parallel_size)
-
-        # get tp device id
-        # self.device_id = (self.dp_rank * self.tp_size + self.tp_rank)
-        # note: https://github.com/vllm-project/vllm-ascend/pull/940 introducing some changes
+        self.dp_group = get_dp_group()
         device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", None)
         
         logger.info(f"os getenv ASCEND_RT_VISIBLE_DEVICES: {device_ids}")
@@ -378,9 +368,48 @@ class MooncakeConnectorWorker:
         else:
             device_ids = list(map(int, device_ids.split(',')))
         assert len(device_ids) > self.tp_rank
-        self.device_id = device_ids[self.tp_rank]
-        logger.info(f"dp_rank {self.dp_rank} "
-                    f"tp_rank {self.tp_rank} device_id {self.device_id}")
+        # self.device_id = device_ids[self.tp_rank + self.dp_group_num*self.dp_size]   
+        # 0: [0,0,2,4] 1:[]
+        
+        self.device_id = device_ids[self.dp_rank * self.tp_size + self.tp_rank]
+        # self.device_id = (self.dp_rank * self.tp_size + self.tp_rank)
+        # TODO just verify TP=1
+        # self.device_id = device_ids[self.dp_rank]
+
+        
+        # 单边port用于TE上进行数据面的传输
+        # self.side_channel_port = (
+        #     BASE_PORT +
+        #     self.dp_rank * self.tp_size + self.tp_rank + self.max_device_id)
+        
+        
+        self.side_channel_port = (
+                BASE_PORT +
+                vllm_config.parallel_config.data_parallel_rank_local *
+                vllm_config.parallel_config.tensor_parallel_size)
+        
+        
+        # get tp device id
+        # self.device_id = (self.dp_rank * self.tp_size + self.tp_rank)
+        # note: https://github.com/vllm-project/vllm-ascend/pull/940 introducing some changes
+        
+        
+        logger.info(f"dp_rank {self.dp_rank} \n"
+            f"tp_rank {self.tp_rank}\n " 
+            f"dp_size {self.dp_size}\n"
+            f"max_device_id {self.max_device_id}\n"
+            f"side_channel_port {self.side_channel_port+ self.tp_rank + self.max_device_id}\n"
+            f"device_id {self.device_id}\n"
+            )
+               
+        #----------------------------------
+
+        # device_ids = os.getenv("ASCEND_RT_VISIBLE_DEVICES", None)
+        # device_ids = device_ids.split(',')
+        # self.dp_rank = get_dp_group().rank_in_group
+        # device_ids = device_ids[self.dp_rank*self.tp_size : (self.dp_rank+1)*self.tp_size]
+        # self.device_id = device_ids[self.tp_rank]
+        #----------------------------------
 
         self.ib_device = None
         self._initialize(
