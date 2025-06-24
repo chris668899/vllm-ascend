@@ -238,11 +238,11 @@ class CustomDeepseekV2MoE(nn.Module):
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
                              "Only silu is supported for now.")
 
-        ascend_config = get_ascend_config()
-        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
-        # NOTE: multistream only effective when `VLLM_ENABLE_MC2` is on
-        self.enable_multistream_moe = \
-            ascend_config.torchair_graph_config.enable_multistream_moe and VLLM_ENABLE_MC2
+        # ascend_config = get_ascend_config()
+        # self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+        # # NOTE: multistream only effective when `VLLM_ENABLE_MC2` is on
+        # self.enable_multistream_moe = \
+        #     ascend_config.torchair_graph_config.enable_multistream_moe and VLLM_ENABLE_MC2
 
         self.gate = ReplicatedLinear(config.hidden_size,
                                      config.n_routed_experts,
@@ -279,11 +279,11 @@ class CustomDeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=True,
-                force_replicate=self.enable_multistream_moe,
+                # force_replicate=self.enable_multistream_moe,
                 prefix=f"{prefix}.shared_experts",
             )
-        else:
-            self.shared_experts = None  # type: ignore
+        # else:
+        #     self.shared_experts = None  # type: ignore
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
         self.dp_size = get_dp_group().world_size
@@ -291,17 +291,21 @@ class CustomDeepseekV2MoE(nn.Module):
         self.tp_group = get_tp_group().device_group
         self.tp_rank = get_tp_group().rank_in_group
         self.ep_group = get_ep_group()
-        additional_config = get_current_vllm_config().additional_config
-        self.enable_graph_mode = False
+        # additional_config = get_current_vllm_config().additional_config
+        # self.enable_graph_mode = False
         self.kv_consumer = None
-        if additional_config:
-            self.enable_graph_mode = additional_config.get("enable_graph_mode", False)
+        # if additional_config:
+        #     self.enable_graph_mode = additional_config.get("enable_graph_mode", False)
         transfer_config = get_current_vllm_config().kv_transfer_config
         if transfer_config is not None:
             self.kv_consumer = transfer_config.kv_role == "kv_consumer"
 
 
         self.params_dtype = torch.get_default_dtype()
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+        # NOTE: multistream only effective when `VLLM_ENABLE_MC2` is on
+        self.enable_multistream_shared_expert =False
 
     def forward(
             self,
@@ -328,9 +332,12 @@ class CustomDeepseekV2MoE(nn.Module):
             enable_force_load_balance = False
 
         num_tokens, hidden_size = hidden_states.shape
-        old_hidden_states = hidden_states
-        use_separated_shared_experts = (self.shared_experts is not None
-                                        and not self.enable_multistream_moe)
+        # old_hidden_states = hidden_states
+        # use_separated_shared_experts = (self.shared_experts is not None
+        #                                 and not self.enable_multistream_moe)
+        multistream = False
+
+        old_hidden_states = hidden_states.clone()
 
         if self.tp_size > 1:
             if (VLLM_ENABLE_MC2
@@ -346,23 +353,26 @@ class CustomDeepseekV2MoE(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        kwargs = {}
+        if multistream:
+            kwargs.update({
+                "shared_experts": self.shared_experts,
+                "shared_hidden_states": old_hidden_states
+            })
 
-        experts_hidden_states = self.experts(
+        hidden_states = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
             is_prefill=is_prefill,
             top_k=CustomDeepseekV2MoE.top_k,
             enable_force_load_balance=enable_force_load_balance,
-            shared_experts=(self.shared_experts
-                            if not use_separated_shared_experts else None),
-        )
+            **kwargs)
 
-        if not isinstance(experts_hidden_states, tuple):
-            hidden_states = experts_hidden_states * self.routed_scaling_factor
-        else:
-            hidden_states = (
-                experts_hidden_states[0] * self.routed_scaling_factor +
-                experts_hidden_states[1])
+        if multistream:
+            hidden_states, shared_output = hidden_states
+
+
+        hidden_states = hidden_states * self.routed_scaling_factor
 
         if self.tp_size > 1:
             if (VLLM_ENABLE_MC2
@@ -376,9 +386,12 @@ class CustomDeepseekV2MoE(nn.Module):
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
-        if use_separated_shared_experts:
-            hidden_states = hidden_states + self.shared_experts(
-                old_hidden_states)
+        if self.n_shared_experts is not None:
+            if not multistream:
+                shared_output = self.shared_experts(old_hidden_states)
+
+        if shared_output is not None:
+            hidden_states = hidden_states + shared_output
 
         return hidden_states.view(num_tokens, hidden_size)
 
