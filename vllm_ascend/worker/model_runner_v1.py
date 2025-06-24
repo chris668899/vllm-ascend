@@ -134,6 +134,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
+        self.kv_transfer_config = vllm_config.kv_transfer_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -900,8 +901,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ]
 
         if self.dp_size > 1:
-            max_num_tokens, with_prefill = self._get_forward_metadata_across_dp(
-                total_num_scheduled_tokens, with_prefill)
+            if has_kv_transfer_group():
+                max_num_tokens = -1
+                with_prefill = self.kv_transfer_config.is_kv_producer
+            else:
+                max_num_tokens, with_prefill = self._get_forward_metadata_across_dp(
+                    total_num_scheduled_tokens, with_prefill)
             extra_builder_kwargs['with_prefill_across_dp'] = with_prefill
 
         # Add graph_pad_size here
@@ -1340,7 +1345,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
-        with set_forward_context(None, self.vllm_config, num_tokens=0):
+        with set_forward_context(None, self.vllm_config):
             self.maybe_setup_kv_connector(scheduler_output)
             finsihed_sending, finished_recving = (
                 self.get_finished_kv_transfer(scheduler_output))
@@ -1789,7 +1794,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
-        print("*********------- new model runner ------------****")
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla
