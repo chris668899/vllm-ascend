@@ -32,14 +32,15 @@ from vllm.attention.backends.utils import (PAD_SLOT_ID, CommonAttentionState,
                                            compute_slot_mapping,
                                            compute_slot_mapping_start_idx,
                                            is_block_tables_empty)
-from vllm.config import get_current_vllm_config
 from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.cache import concat_and_cache_mla
 from vllm_ascend.platform import CUSTOM_OP_ENABLED
 from vllm_ascend.worker.model_runner import (
     ModelInputForNPUBuilder, ModelInputForNPUWithSamplingMetadata)
 
+_ALLOWED_NUM_QUERIES_PER_KV = [32, 64, 128]
 
 def generate_attn_mask(max_seq_len: int, dtype=torch.float16, mask_value=None):
     # Construct lower triangle matrix.
@@ -720,6 +721,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
     ) -> None:
         self.num_heads = num_heads
@@ -961,6 +963,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
@@ -1000,11 +1003,17 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
         self.w_kc = None
         self.w_vc = None
 
-        self.enable_graph_mode = False
-        additional_config = get_current_vllm_config().additional_config
-        if additional_config:
-            self.enable_graph_mode = additional_config.get(
-                "enable_graph_mode", False)
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+
+        # TODO: support numHeads / numKvHeads < 16 in MLA kernel
+        if self.torchair_graph_enabled:
+            assert self.num_queries_per_kv in _ALLOWED_NUM_QUERIES_PER_KV, \
+                ("The allowed number of queries per kv when enabling both MLA and Graph mode"
+                " only support {32, 64, 128}, Thus this is not supported for DeepSeek-V2-Lite,"
+                " as it only has 16 attention heads. And if you're using DeepSeek-V3 or DeepSeek-R1,"
+                " please make sure after the tensor parallel split, num_heads / num_kv_heads in "
+                "{32, 64, 128}.")
 
     def exec_kv(
         self,
@@ -1177,7 +1186,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                                                        self.num_heads, -1)
 
         # TODO: Replace the env with more flexible expressions
-        if self.enable_graph_mode:
+        if self.torchair_graph_enabled:
             if len(kv_cache) > 0 and kv_cache[0].numel(
             ) > 0 and attn_metadata.num_prefills > 0:
                 slots = attn_metadata.slot_mapping
@@ -1228,7 +1237,7 @@ class AscendMLAAttentionBackendImpl(MLAAttentionImpl):
                 )
         elif attn_metadata.decode_metadata:
             assert kv_cache is not None
-            if self.enable_graph_mode:
+            if self.torchair_graph_enabled:
                 # shape of query for npu graph mode should be:
                 # [bs, num_heads_per_rank, seq_len, dim]
                 q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1)
